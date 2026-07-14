@@ -1,0 +1,30 @@
+{
+  "input_file": "outputs_omni/mas_cmc_w4a8_rank02_p0_librispeech_test_other_512_response.jsonl",
+  "scored_output": "outputs_omni/mas_cmc_w4a8_rank02_p0_librispeech_test_other_512_jiwer.scored.jsonl",
+  "samples": 512,
+  "failed": 0,
+  "empty_hyp": 0,
+  "hit_max_new_tokens": 0,
+  "exact_match": 202,
+  "exact_match_rate": 0.39453125,
+  "N": 8521,
+  "substitutions": 636,
+  "insertions": 98,
+  "deletions": 103,
+  "edit_distance": 837,
+  "wer_fraction": 0.09822790752259125,
+  "wer_percent": 9.822790752259126,
+  "wer_implementation": "jiwer.process_words",
+  "jiwer_version": "4.0.0",
+  "normalization": "librispeech_basic",
+  "generated_token_count": {
+    "count": 512,
+    "min": 3,
+    "max": 106,
+    "mean": 22.046875,
+    "median": 19.0
+  },
+  "fixed_prefix_counts": {},
+  "loopish_outputs": 10,
+  "max_repeated_token_run": 2
+}
