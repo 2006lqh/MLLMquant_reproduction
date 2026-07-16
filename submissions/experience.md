@@ -1,123 +1,33 @@
-# Reproduction Record
+# Implementation Notes and Findings
 
-## Project Scope
+## MAS and CMC in the Local Code
 
-This record covers Qwen2.5-Omni-3B audio-text evaluation on LibriSpeech
-test-other and the MAS/CMC reproduction workflow.
+MASQuant addresses smoothing misalignment: text, audio, and vision can have incompatible activation ranges, so one shared smooth scale can favor the dominant modality. `quantize/svd_utils.py:trans_scales()` expands the stored text/audio/vision scales for every decoder layer. `quantize/int_linear.py` then selects a scale from the multimodal token mask. The base model remains shared; MAS changes the scaling used before quantized linear computation rather than storing three complete models.
 
-## Dense Precision Terminology
+CMC restores the modality-specific weight behavior that would otherwise be lost by a shared quantized base. In `modality_err_low_rank_decomposition()`, the text-smoothed quantized weight is the base and the audio-smoothed weight is the target. With `quant_cmc=0`, the target is not quantized a second time. The transposed difference is whitened, decomposed by SVD, and stored as L/R factors. `infer_quant.py` attaches existing audio L/R factors to the matching quantized linear layers.
 
-The released Qwen2.5-Omni branch in `models/LMClass.py` passes
-`torch_dtype=torch.bfloat16`, enables `device_map="auto"`, disables audio
-output, forwards the requested attention implementation, and uses the Thinker
-component for this workflow. Therefore new released-loader dense runs use the
-method name `dense-bf16` and dtype label `bfloat16`.
+The mask is available during multimodal prefill. During one-token autoregressive decode, `int_linear.py` defaults to the text mask. Audio CMC therefore addresses the audio-input portion of ASR; it does not make the later text decode path equivalent to Dense.
 
-The MASQuant paper's original table label remains `Dense FP16`. The released
-loader does not prove the paper experiment's actual runtime dtype, so the two
-statements must not be conflated.
+## Cache Lifecycle
 
-The retained Dense P0 full2939 log identifies Qwen2.5-Omni, calls `main.py`,
-and corresponds to the retained response and summary, but it does not print a
-runtime dtype. It is therefore `INFERRED_BF16_NOT_DIRECTLY_LOGGED`, not
-runtime-verified BF16. The retained sorted512 score is derived from that P0
-response and has the same evidence level. P3 has no retained runtime log or
-artifact and its dtype is `NOT VERIFIED`.
+The local cache has four distinct roles. The activation dataloader provides calibration inputs for activation statistics and MAS optimization. `mas-parameters.pth` is the direct scale input to formal quantized inference. The CMC dataloader provides audio inputs for the white matrix; the white matrix is used when building an adapter, not recomputed during formal inference. A rank-specific low-rank adapter is the direct CMC input during inference.
 
-## Environment and Attention
+The retained cache names identify a `text-audio` calibration set with 128 samples. This is narrower than the upstream Qwen2.5-Omni example, which demonstrates `text-audio-vision` calibration. The local ASR task consumes only text and audio, while the model and scale structure still support vision. Dense inference consumes none of the MAS/CMC cache.
 
-The evaluated environment uses the local MASQuant environment with PyTorch,
-Transformers, jiwer, and local model and dataset assets. Dtype and attention
-backend are independent fields. The released Qwen2.5-Omni loader receives the
-requested `--attn_implementation`; the local parser default is `eager`.
-Historical P0 records `attn_implementation='eager'` as requested, but its
-actual runtime backend is `NOT VERIFIED`. Future runs must record both the
-requested backend and the loaded configuration value before generation.
+## ASR Evaluation Path
 
-## Dataset and Scoring Protocol
+`main.py` verifies FLAC/transcript ID correspondence, builds a chat message containing an audio path and an ASR prompt, calls `AutoProcessor.apply_chat_template()`, obtains multimodal inputs through `process_mm_info()`, and invokes `generate()`. It writes response JSONL during generation. Its offline scorer applies `qwen_asr_en` to both sides, calls `jiwer.process_words`, and writes scored JSONL and a summary.
 
-LibriSpeech transcripts are paired with FLAC files by utterance ID. Historical
-`librispeech_basic` scoring lowercases, strips punctuation, normalizes
-whitespace, strips fixed ASR response prefixes, and aggregates global S/I/D/N.
-The full2939 Dense P0 summary records `levenshtein_fallback`; that historical
-result was not scored by jiwer. The sorted512 retained summaries record
-`jiwer.process_words` with historical version `unknown`.
+`qwen_asr_en` is a vendored Qwen English ASR normalization sequence: special-token removal, English and basic normalization, lowercase tokenization, punctuation removal, and whitespace cleanup. Using the same normalization on reference and hypothesis prevents formatting differences from being treated as transcription errors, but the chosen normalizer remains part of the evaluation protocol.
 
-Future P1 runs use `qwen_asr_en`: symmetric lowercase, punctuation stripping,
-and whitespace normalization without prefix stripping, prompt-specific edits,
-mr/mister substitutions, manual number fixes, or exclusions for empty and
-hit-max responses. This strict mode requires jiwer and logs the actual scorer
-and version.
+## What the Results Establish
 
-## Future P1 Protocol
+With the matched P1 protocol, Dense BF16 + FA2 reaches 4.5195% WER, full-rank W4A8 reaches 4.6991%, and rank0p2 W4A8 reaches 4.8447%. Full-rank is closer to Dense and has 77 fewer edits than rank0p2. The P1 summaries have no failed samples, empty outputs, or token-limit hits, so these comparisons are not driven by obvious generation failure.
 
-P1 system prompt: `You are a speech recognition model.`
+P0 demonstrates prompt sensitivity rather than a competing quantization result. Dense P0 is 4.4193%, while full-rank P0 is 6.3235% and contains two empty outputs plus four token-limit hits. P0 and P1 should therefore not be merged into one ranking.
 
-P1 user prompt: `Transcribe the English audio into text without any punctuation marks.`
+## Relation to the Paper
 
-Future P1 Dense runs must use `--method_name dense-bf16`,
-`--model_dtype_label bfloat16`, `--prompt_label p1`, and runtime validation of
-the Thinker first floating parameter and first `q_proj.weight` as
-`torch.bfloat16`. Response records must include model, method, dtype evidence,
-paper baseline label, prompt fields, attention requested/actual, Talker state,
-`return_audio`, generation configuration, and normalization.
+The MASQuant paper evaluates Qwen2.5-Omni-3B on LibriSpeech `test-other` and reports 3.9% Dense FP16 WER and 3.6% MASQuant W4A8 WER in Table 2. The local P1 values are higher by 0.6195 and 1.0991 percentage points for Dense and full-rank W4A8, respectively. Because the Dense baseline is already higher, the discrepancy is not attributable only to CMC.
 
-## Source Modifications
-
-The local changes are in `custom_dataset.py`, `generate_act_scale_shift.py`,
-`infer_mas.py`, `main.py`, `models/LMClass.py`,
-`models/modeling_qwen2_5_omni.py`, `quantize/infer_quant.py`,
-`quantize/masquant.py`, and `quantize/svd_utils.py`.
-
-They provide local LibriSpeech loading, ASR JSONL generation and scoring,
-text-audio calibration and CMC support, local-only model loading, thinker-only
-text generation, and device-safe temporary tensor handling. These are
-engineering and benchmark-evaluation adaptations; they do not introduce a new
-MAS or CMC mathematical method.
-
-## Artifact Policy
-
-- Experiment artifacts: `/home/zhouyangchengyu/project_origin/submissions/experiments`
-- Logs: `/home/zhouyangchengyu/project_origin/submissions/logs`
-- Caches: `/home/zhouyangchengyu/project_origin/cache`
-
-Only response, scored, summary, and run-log artifacts are retained by default.
-Do not create archived input manifests, comparison artifacts, or diagnostic
-artifacts unless explicitly requested. Historical logs are preserved as original
-runtime output; they are not rewritten when artifact naming changes.
-
-## Current Artifact Inventory
-
-As of 2026-07-17, six complete full2939 result sets are retained for
-LibriSpeech test-other. Each set has a response JSONL, offline scored JSONL,
-summary JSON, and matching run log:
-
-- `dense-bf16` P0: historical retained run, `librispeech_basic` scoring and
-  inferred dtype evidence only.
-- `dense-bf16-fa2` P0 and P1: runtime-observed BF16 and FlashAttention 2.
-- `mas-cmc-w4a8-fullrank-audio-fa2` P0 and P1: W4A8 MAS plus audio CMC with
-  full rank, runtime-observed BF16 and FlashAttention 2.
-- `mas-cmc-w4a8-rank0p2-audio-fa2` P1: W4A8 MAS plus audio-only CMC at rank
-  ratio 0.2, runtime-observed BF16 and FlashAttention 2.
-
-The `dense-bf16` P1 run log is retained as historical runtime output, but its
-formal response, scored, and summary artifacts are not present. It is not a
-completed result set and is intentionally excluded from `result.md`.
-
-The rank0p2 P1 run passed CPU-only offline scoring after an exact 2939-ID
-response integrity check. Its score is based on `qwen_asr_en` with
-`jiwer.process_words` 4.0.0; no failed, empty, or hit-max responses were
-recorded.
-
-## Naming Convention
-
-Experiment artifacts use `<model>__<method>__<dataset>__<subset>__<prompt>__<artifact>`.
-Dense Qwen2.5-Omni releases use `dense-bf16`; quantized experiments retain their
-actual quantization method names, such as `mas-cmc-w4a8-rank0p2`.
-
-## Maintenance Policy
-
-`result.md` and `experience.md` are updated only after an explicit project
-instruction. Future source modifications must retain replaced upstream code
-blocks as concise adjacent comments; independent `.old`, `.orig`, and `.bak`
-source copies are not used.
+Confirmed protocol differences are BF16 versus the paper's FP16 label, local FA2 dispatch, a fixed P1 prompt, `qwen_asr_en` plus `jiwer` 4.0.0 scoring, and text-audio cached calibration. Table 2 does not disclose the paper's corresponding prompt, normalization, decoder settings, CMC rank, calibration mixture, or attention backend. These differences are plausible contributors, not measured causal explanations. The paper reference is `EfficientAI/masquant/paper/table_2_qwen_omni.jpg` and [MASQuant](https://arxiv.org/html/2603.04800v1).

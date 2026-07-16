@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 import random
 import numpy as np
+import json
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 # from models.int_qwen_omni_layer import omni_quantize_model
@@ -94,10 +95,35 @@ parser.add_argument("--compute_wer", action="store_true")
 parser.add_argument("--librispeech_root", default="/data/liuqinheng/benchmark/LibriSpeech")
 parser.add_argument("--split", default="test-other")
 parser.add_argument("--max_samples", type=int, default=None)
+parser.add_argument("--sample_order", default="sorted", choices=["sorted", "random", "speaker_stratified"])
+parser.add_argument("--sample_seed", type=int, default=42)
+parser.add_argument("--subset_name", default="")
 parser.add_argument("--max_new_tokens", type=int, default=256)
 parser.add_argument("--asr_prompt", default=ASR_PROMPT)
+parser.add_argument("--asr_system_prompt", default="")
+parser.add_argument("--prompt_label", default="")
+parser.add_argument("--prompt_source", default="CLI arguments")
+parser.add_argument("--method_name", default="mas-cmc-w4a8-fullrank-audio-fa2")
+parser.add_argument("--model_dtype_label", default="bfloat16")
+parser.add_argument(
+    "--normalization",
+    default="librispeech_basic",
+    choices=["librispeech_basic", "qwen_asr_en"],
+)
+parser.add_argument("--score_output", default="")
+parser.add_argument("--scored_output", default="")
+parser.add_argument("--cmc_scope", default="audio", choices=["audio", "vision", "audio-vision"])
+parser.add_argument("--full_rank", action="store_true")
+parser.add_argument("--fullrank_adapter_sha256", default="")
+parser.add_argument("--scales_sha256", default="")
+parser.add_argument("--white_matrix_sha256", default="")
 parser.add_argument("--local_files_only", action="store_true")
 parser.add_argument("--max_memory_gib", type=int, default=None)
+parser.add_argument(
+    "--runtime_validation",
+    action="store_true",
+    help="Record actual FA2 and audio-CMC branch activity during a bounded ASR preflight.",
+)
 parser.add_argument("--modalities", type=int, default=3)
 parser.add_argument(
     "--dataset-type",
@@ -216,7 +242,9 @@ elif "vl" in args.model.lower():
     model_type = "vl"
 else:
     raise Exception("Unknown model type")
-scales = torch.load(scales_path)
+# Keep large calibration artifacts on host RAM until their per-layer CUDA transfer.
+# This avoids inheriting serialized device placement during shared-GPU evaluation.
+scales = torch.load(scales_path, map_location="cpu", weights_only=False)
 print(f"MAS parameters loaded: True ({scales_path})")
 if model_type == "omni":
     down_shape = llm.model.model.layers[0].mlp.down_proj.weight.shape[1]
@@ -230,11 +258,15 @@ white_matrix = None
 low_rank_adapters = None
 if args.LR:
     if os.path.isfile(save_low_rank_adapters): #如果已经做好了低秩分解，直接读取
-        low_rank_adapters = torch.load(save_low_rank_adapters)
+        low_rank_adapters = torch.load(
+            save_low_rank_adapters, map_location="cpu", weights_only=False
+        )
     elif rank > 0:
         # 先计算白化矩阵
         if os.path.isfile(save_white_matrix_path):
-            white_matrix = torch.load(save_white_matrix_path)
+            white_matrix = torch.load(
+                save_white_matrix_path, map_location="cpu", weights_only=False
+            )
         else:
             if args.cali_data_type == "text-audio-vision": #使用omnibench128校准:
                 vision_white_matrix = get_white_matrix(llm.model, processor, vision_scales, args,  2048,
@@ -349,6 +381,48 @@ if args.quantize:
         raise RuntimeError("Refusing WER evaluation: no quantized thinker layers were found")
     if args.compute_wer and args.LR and rank is not None and rank > 0 and not cmc_enabled:
         raise RuntimeError("Refusing MAS+CMC WER evaluation: low-rank CMC adapters are not attached")
+    runtime_stats = None
+    if args.runtime_validation:
+        # Preflight-only instrumentation: count the dispatched attention path and
+        # observe a real, nonzero audio CMC contribution without changing outputs.
+        from models.int_qwen_omni_layer import QuantQwenAttentionV2
+
+        runtime_stats = {"flash_attention_2_calls": 0, "sdpa_calls": 0, "eager_calls": 0,
+                         "audio_mask_tokens": 0, "audio_cmc_nonzero_calls": 0,
+                         "audio_cmc_max_norm": 0.0}
+        original_flash = QuantQwenAttentionV2.forward_flash_attn
+        original_sdpa = QuantQwenAttentionV2.forward_sdpa
+        original_quant_forward = QuantLinear.forward_mas_infer
+
+        def counted_flash(self, *call_args, **call_kwargs):
+            runtime_stats["flash_attention_2_calls"] += 1
+            return original_flash(self, *call_args, **call_kwargs)
+
+        def counted_sdpa(self, *call_args, **call_kwargs):
+            runtime_stats["sdpa_calls"] += 1
+            return original_sdpa(self, *call_args, **call_kwargs)
+
+        def counted_quant_forward(self, input, multi_modal_mask=None):
+            if multi_modal_mask is not None and input.shape[1] != 1 and self.La is not None:
+                audio_mask = multi_modal_mask[0]
+                audio_tokens = int(audio_mask.any(dim=-1).sum().item())
+                runtime_stats["audio_mask_tokens"] += audio_tokens
+                if audio_tokens:
+                    input_audio = self.get_masked_value(
+                        audio_mask, input.to(torch.bfloat16)
+                    ) / self.audio_smooth_scale
+                    branch = torch.matmul(torch.matmul(input_audio, self.La), self.Ra)
+                    branch_norm = float(branch.float().norm().item())
+                    runtime_stats["audio_cmc_max_norm"] = max(
+                        runtime_stats["audio_cmc_max_norm"], branch_norm
+                    )
+                    if branch_norm > 0.0:
+                        runtime_stats["audio_cmc_nonzero_calls"] += 1
+            return original_quant_forward(self, input, multi_modal_mask)
+
+        QuantQwenAttentionV2.forward_flash_attn = counted_flash
+        QuantQwenAttentionV2.forward_sdpa = counted_sdpa
+        QuantLinear.forward_mas_infer = counted_quant_forward
     del white_matrix
     white_matrix = None
     del low_rank_adapters
@@ -357,3 +431,14 @@ if args.quantize:
     gc.collect()
     torch.cuda.empty_cache()
 evaluate(llm, args, logger)
+if args.runtime_validation:
+    print("RUNTIME_VALIDATION=" + json.dumps(runtime_stats, sort_keys=True))
+    if (
+        runtime_stats["flash_attention_2_calls"] <= 0
+        or runtime_stats["sdpa_calls"] != 0
+        or runtime_stats["eager_calls"] != 0
+        or runtime_stats["audio_mask_tokens"] <= 0
+        or runtime_stats["audio_cmc_nonzero_calls"] <= 0
+        or runtime_stats["audio_cmc_max_norm"] <= 0.0
+    ):
+        raise RuntimeError("Runtime validation failed: " + json.dumps(runtime_stats, sort_keys=True))

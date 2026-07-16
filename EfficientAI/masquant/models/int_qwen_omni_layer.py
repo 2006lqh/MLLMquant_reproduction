@@ -349,11 +349,10 @@ class QuantQwenAttentionV2(nn.Module):
             multi_modal_mask=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
-        # forward_flash_attn
-        # forward_sdpa
-        if True or self.training:
-            # if False:
-            # if self.training:
+        # Preserve the upstream training path, but honour the configured backend
+        # during inference. Upstream unconditionally selected SDPA here, which
+        # prevented an explicit FlashAttention 2 request from taking effect.
+        if self.training:
             return self.forward_sdpa(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -364,7 +363,8 @@ class QuantQwenAttentionV2(nn.Module):
                 position_embeddings=position_embeddings,
                 multi_modal_mask=multi_modal_mask,
             )
-        else:
+        actual_impl = getattr(self.config, "_attn_implementation", None)
+        if actual_impl == "flash_attention_2":
             return self.forward_flash_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -375,6 +375,20 @@ class QuantQwenAttentionV2(nn.Module):
                 position_embeddings=position_embeddings,
                 multi_modal_mask=multi_modal_mask,
             )
+        if actual_impl == "sdpa":
+            return self.forward_sdpa(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                multi_modal_mask=multi_modal_mask,
+            )
+        raise RuntimeError(
+            f"Unsupported or unverified quantized attention backend: {actual_impl}"
+        )
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
         # setting weight quantization here does not affect actual forward pass

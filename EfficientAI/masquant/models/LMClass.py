@@ -28,6 +28,25 @@ from transformers import (
     AutoProcessor,
     AutoModel
 )
+
+
+def prepare_qwen_omni_attention_config(config, requested_attn):
+    """Propagate the requested backend to the Qwen Omni Thinker text config."""
+    thinker_config = getattr(config, "thinker_config", None)
+    if thinker_config is None:
+        raise RuntimeError("Qwen2.5-Omni thinker_config is missing")
+    text_config = getattr(thinker_config, "text_config", None)
+    if text_config is None:
+        raise RuntimeError("Qwen2.5-Omni thinker_config.text_config is missing")
+
+    # Transformers only applies the top-level request automatically here. Keep
+    # the Thinker text decoder aligned without changing weights or MAS/CMC math.
+    config._attn_implementation = requested_attn
+    thinker_config._attn_implementation = requested_attn
+    text_config._attn_implementation = requested_attn
+    return config
+
+
 class LMClass(BaseLM):
     def __init__(self, args):
         super().__init__()
@@ -70,18 +89,27 @@ class LMClass(BaseLM):
             # from transformers import Qwen2_5OmniForConditionalGeneration
             from models.modeling_qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
             import copy
+            config = prepare_qwen_omni_attention_config(config, args.attn_implementation)
+            config.enable_audio_output = False
             kwargs = {
+                "config": config,
                 "device_map": "auto",
-                "enable_audio_output": False,
-                "attn_implementation": args.attn_implementation,
+                # The released Qwen2.5-Omni loader runs the Thinker in BF16.
+                # Paper tables retain their original "Dense FP16" label, while
+                # this reproduction names runtime artifacts from torch_dtype.
+                # This terminology clarification does not change model numerics.
                 "torch_dtype": torch.bfloat16,
                 "local_files_only": local_files_only,
             }
             if max_memory is not None:
                 kwargs["max_memory"] = max_memory
             model = Qwen2_5OmniForConditionalGeneration.from_pretrained(args.model, **kwargs)
-            # import pdb;pdb.set_trace()
-            # model.half()
+            if torch.cuda.is_available() and not getattr(model, "hf_device_map", None):
+                # Transformers 4.52.0 clears ``device_map`` when no tensor-parallel
+                # plan is active. Retain the requested auto map above, then place
+                # this single-visible-GPU run explicitly when that loader bug occurs.
+                model.to(self._device)
+            # Do not add a model.half() conversion: the released loader is BF16.
             if args.eval_sqnr:
                 self.model_origin = copy.deepcopy(model)
             else:

@@ -48,14 +48,22 @@ def mas_quantize_model(
             # ------------------------------------------------------------------
             if args.rank > 0:
                 if "vision" in low_rank_adapters and name in low_rank_adapters["vision"]:
-                    m.Lv = low_rank_adapters["vision"][name]["L"].to(m.weight.dtype)
-                    m.Rv = low_rank_adapters["vision"][name]["R"].to(m.weight.dtype)
+                    m.Lv = low_rank_adapters["vision"][name]["L"].to(
+                        device=m.weight.device, dtype=m.weight.dtype
+                    )
+                    m.Rv = low_rank_adapters["vision"][name]["R"].to(
+                        device=m.weight.device, dtype=m.weight.dtype
+                    )
                 else:
                     m.Lv = None
                     m.Rv = None
                 if "audio" in low_rank_adapters and name in low_rank_adapters["audio"]:
-                    m.La = low_rank_adapters["audio"][name]["L"].to(m.weight.dtype)
-                    m.Ra = low_rank_adapters["audio"][name]["R"].to(m.weight.dtype)
+                    m.La = low_rank_adapters["audio"][name]["L"].to(
+                        device=m.weight.device, dtype=m.weight.dtype
+                    )
+                    m.Ra = low_rank_adapters["audio"][name]["R"].to(
+                        device=m.weight.device, dtype=m.weight.dtype
+                    )
                 else:
                     m.La = None
                     m.Ra = None

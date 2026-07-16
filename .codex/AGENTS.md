@@ -40,7 +40,6 @@ The following paths exist at the project root:
 - `EfficientAI/masquant/`
 - `submissions/`
 - `submissions/experiments/`
-- `submissions/experiments/inputs/`
 - `submissions/logs/`
 - `cache/`
 
@@ -51,7 +50,6 @@ Do not invent project paths. For any required path not confirmed by the current 
 Place reproducible experiment artifacts under:
 
 - `submissions/experiments/`
-- `submissions/experiments/inputs/` for immutable run inputs
 - `submissions/logs/` for process logs
 - `cache/` and its subdirectories for regenerable caches
 

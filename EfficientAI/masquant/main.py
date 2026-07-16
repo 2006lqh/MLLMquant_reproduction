@@ -61,6 +61,14 @@ import json
 import csv
 import pdb
 import re
+import sacrebleu.tokenizers as sacrebleu_tokenizers
+if not hasattr(sacrebleu_tokenizers, "TOKENIZERS"):
+    from sacrebleu.tokenizers.tokenizer_none import NoneTokenizer
+
+    sacrebleu_tokenizers.TOKENIZERS = {"none": NoneTokenizer}
+from eval_utils.qwen_asr.evaluate_tokenizer import EvaluationTokenizer
+from eval_utils.qwen_asr.whisper_normalizer.basic import BasicTextNormalizer
+from eval_utils.qwen_asr.whisper_normalizer.english import EnglishTextNormalizer
 
 torch.backends.cudnn.benchmark = True
 
@@ -97,6 +105,8 @@ net_choices = [
 # ----------------------------------------------------------------------
 ASR_PROMPT = "Please transcribe the speech in the audio. Do not add any explanation."
 ASR_PROMPT_P0 = "Transcribe the speech into English. Output only the transcription text."
+ASR_SYSTEM_PROMPT_P1 = "You are a speech recognition model."
+ASR_PROMPT_P1 = "Transcribe the English audio into text without any punctuation marks."
 ASR_PREFIXES = (
     "the transcription is:",
     "the speech says:",
@@ -104,14 +114,34 @@ ASR_PREFIXES = (
     "it says:",
 )
 
+_QWEN_ENGLISH_NORMALIZER = EnglishTextNormalizer()
+_QWEN_BASIC_NORMALIZER = BasicTextNormalizer()
+_QWEN_EVALUATION_TOKENIZER = EvaluationTokenizer(
+    tokenizer_type="none",
+    lowercase=True,
+    punctuation_removal=True,
+    character_tokenization=False,
+)
+
 
 def normalize_asr_text(text):
+    """Legacy ``librispeech_basic`` normalization retained for historical scores."""
     text = str(text or "").strip().lower()
     for prefix in ASR_PREFIXES:
         if text.startswith(prefix):
             text = text[len(prefix):].lstrip()
             break
     text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split())
+
+
+def normalize_qwen_asr_en_text(text):
+    """Apply the pinned Qwen2-Audio English ASR scoring pipeline symmetrically."""
+    text = str(text or "")
+    text = re.sub(r"<\|.*?\|>", " ", text)
+    text = _QWEN_ENGLISH_NORMALIZER(text)
+    text = _QWEN_BASIC_NORMALIZER(text)
+    text = _QWEN_EVALUATION_TOKENIZER.tokenize(text)
     return " ".join(text.split())
 
 
@@ -140,20 +170,35 @@ def _fallback_word_error_counts(reference, hypothesis):
     return substitutions, insertions, deletions
 
 
-def word_error_counts(reference, hypothesis):
+def word_error_counts(reference, hypothesis, require_jiwer=False):
     try:
-        from jiwer import process_words
-        result = process_words(reference, hypothesis)
-        return result.substitutions, result.insertions, result.deletions, "jiwer"
-    except ImportError:
+        import jiwer
+        from importlib.metadata import version
+
+        result = jiwer.process_words(reference, hypothesis)
+        return (
+            result.substitutions,
+            result.insertions,
+            result.deletions,
+            "jiwer.process_words",
+            version("jiwer"),
+        )
+    except ImportError as exc:
+        if require_jiwer:
+            raise RuntimeError(
+                "qwen_asr_en requires jiwer; install it before running a strict ASR score."
+            ) from exc
         substitutions, insertions, deletions = _fallback_word_error_counts(reference, hypothesis)
-        return substitutions, insertions, deletions, "levenshtein_fallback"
+        return substitutions, insertions, deletions, "levenshtein_fallback", None
 
 
 def normalize_librispeech_text(text, normalization="librispeech_basic"):
-    if normalization != "librispeech_basic":
+    if normalization == "librispeech_basic":
+        return normalize_asr_text(text)
+    if normalization == "qwen_asr_en":
+        return normalize_qwen_asr_en_text(text)
+    else:
         raise ValueError(f"Unsupported ASR normalization: {normalization}")
-    return normalize_asr_text(text)
 
 
 def load_librispeech_samples(root, split="test-other", max_samples=None, sample_order="sorted", sample_seed=42):
@@ -288,6 +333,138 @@ def get_record_hypothesis(record):
     return ""
 
 
+def _first_floating_parameter_dtype(module):
+    for _, parameter in module.named_parameters():
+        if torch.is_floating_point(parameter):
+            return str(parameter.dtype)
+    return None
+
+
+def _first_q_proj_dtype(module):
+    for name, parameter in module.named_parameters():
+        if name.endswith("q_proj.weight"):
+            return str(parameter.dtype)
+    return None
+
+
+def _attention_implementation(config):
+    if config is None:
+        return None
+    value = getattr(config, "_attn_implementation", None)
+    if value is None:
+        value = getattr(config, "attn_implementation", None)
+    return value
+
+
+def _parameter_devices(module):
+    return sorted({str(parameter.device) for parameter in module.parameters()})
+
+
+def collect_qwen_omni_runtime_metadata(llm, generation_model, args):
+    """Capture observed runtime properties without changing model state."""
+    thinker = getattr(generation_model, "thinker", llm.model)
+    config = getattr(generation_model, "config", None)
+    thinker_config = getattr(thinker, "config", None)
+    text_config = getattr(thinker_config, "text_config", None)
+    actual_attention = _attention_implementation(config)
+    thinker_attention = _attention_implementation(thinker_config)
+    text_attention = _attention_implementation(text_config)
+    device_map = getattr(generation_model, "hf_device_map", None)
+    if isinstance(device_map, dict):
+        device_map = {str(key): str(value) for key, value in device_map.items()}
+    elif device_map is not None:
+        device_map = str(device_map)
+
+    metadata = {
+        "wrapper_class": generation_model.__class__.__name__,
+        "thinker_class": thinker.__class__.__name__,
+        "wrapper_first_float_dtype": _first_floating_parameter_dtype(generation_model),
+        "thinker_first_float_dtype": _first_floating_parameter_dtype(thinker),
+        "thinker_q_proj_dtype": _first_q_proj_dtype(thinker),
+        "attention_requested": args.attn_implementation,
+        "attention_actual": actual_attention,
+        "thinker_attention_actual": thinker_attention,
+        "text_decoder_attention_actual": text_attention,
+        "talker_enabled": bool(getattr(generation_model, "has_talker", False)),
+        "hf_device_map": device_map,
+        "parameter_devices": _parameter_devices(generation_model),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "visible_gpu_count": torch.cuda.device_count(),
+    }
+    if args.method_name == "dense-bf16":
+        expected = str(torch.bfloat16)
+        if metadata["thinker_first_float_dtype"] != expected or metadata["thinker_q_proj_dtype"] != expected:
+            raise RuntimeError(
+                "dense-bf16 requires BF16 Thinker parameters and first q_proj weight; "
+                f"observed thinker={metadata['thinker_first_float_dtype']}, "
+                f"q_proj={metadata['thinker_q_proj_dtype']}."
+            )
+        if metadata["talker_enabled"]:
+            raise RuntimeError("dense-bf16 ASR requires the Qwen talker to be disabled.")
+        if metadata["visible_gpu_count"] != 1:
+            raise RuntimeError(
+                "dense-bf16 ASR requires exactly one CUDA-visible GPU; "
+                f"observed {metadata['visible_gpu_count']}."
+            )
+        if metadata["text_decoder_attention_actual"] != args.attn_implementation:
+            raise RuntimeError(
+                "dense-bf16 ASR attention mismatch for the text decoder: "
+                f"requested={args.attn_implementation}, "
+                f"actual={metadata['text_decoder_attention_actual']}."
+            )
+    return metadata
+
+
+def asr_response_metadata(args, runtime_metadata, generation_config):
+    dtype_evidence = "runtime_verified" if args.method_name == "dense-bf16" else "runtime_observed"
+    return {
+        "model": args.model,
+        "method": args.method_name,
+        "model_dtype": args.model_dtype_label,
+        "model_dtype_torch": runtime_metadata["thinker_first_float_dtype"],
+        "dtype_evidence": dtype_evidence,
+        "paper_baseline_label": "Dense FP16",
+        "dataset": "LibriSpeech",
+        "split": args.split,
+        "prompt_label": args.prompt_label,
+        "system_prompt": args.asr_system_prompt,
+        "user_prompt": args.asr_prompt,
+        "prompt_source": args.prompt_source,
+        "attention_requested": runtime_metadata["attention_requested"],
+        "attention_actual": runtime_metadata["attention_actual"],
+        "thinker_attention_actual": runtime_metadata["thinker_attention_actual"],
+        "text_decoder_attention_actual": runtime_metadata["text_decoder_attention_actual"],
+        "talker_enabled": runtime_metadata["talker_enabled"],
+        "return_audio": False,
+        "generation_config": generation_config,
+        "normalization": args.normalization,
+        "subset_name": args.subset_name,
+        "quantization": "None" if args.method_name == "dense-bf16" else "unspecified",
+        "logical_weight_bits": getattr(args, "wbits", None),
+        "logical_activation_bits": getattr(args, "abits", None),
+        "mas_enabled": bool(getattr(args, "quantize", False)),
+        "cmc_enabled": bool(getattr(args, "LR", False) and getattr(args, "rank", 0) > 0),
+        "cmc_scope": getattr(args, "cmc_scope", ""),
+        "quant_cmc": getattr(args, "quant_cmc", None),
+        "rank_argument": getattr(args, "rank", None),
+        "full_rank": bool(getattr(args, "full_rank", False)),
+        "fullrank_adapter_sha256": getattr(args, "fullrank_adapter_sha256", ""),
+        "scales_sha256": getattr(args, "scales_sha256", ""),
+        "white_matrix_sha256": getattr(args, "white_matrix_sha256", ""),
+        "normalizer_source_repository": "QwenLM/Qwen2-Audio" if args.normalization == "qwen_asr_en" else "",
+        "normalizer_source_commit": "595360e82b5839c1507492ec83cae5bda6d5c7d4" if args.normalization == "qwen_asr_en" else "",
+        "normalizer_pipeline": [
+            "str",
+            "remove_qwen_special_tokens",
+            "EnglishTextNormalizer",
+            "BasicTextNormalizer",
+            "EvaluationTokenizer(tokenizer_type=none, lowercase=True, punctuation_removal=True, character_tokenization=False)",
+            "collapse_whitespace_strip",
+        ] if args.normalization == "qwen_asr_en" else [],
+        "prefix_stripping": False if args.normalization == "qwen_asr_en" else None,
+    }
+
+
 def score_librispeech_jsonl(args):
     input_path = Path(args.input_file)
     if not input_path.is_file():
@@ -310,6 +487,8 @@ def score_librispeech_jsonl(args):
     hit_max = 0
     examples = []
     wer_impl = "levenshtein_fallback"
+    jiwer_version = None
+    response_metadata = None
 
     scored_handle = scored_path.open("w", encoding="utf-8") if scored_path else None
     try:
@@ -319,6 +498,48 @@ def score_librispeech_jsonl(args):
                     continue
                 record = json.loads(line)
                 sample_count += 1
+                if response_metadata is None:
+                    response_metadata = {
+                        key: record.get(key)
+                        for key in (
+                            "model",
+                            "method",
+                            "model_dtype",
+                            "model_dtype_torch",
+                            "dtype_evidence",
+                            "paper_baseline_label",
+                            "quantization",
+                            "dataset",
+                            "split",
+                            "subset_name",
+                            "prompt_label",
+                            "system_prompt",
+                            "user_prompt",
+                            "prompt_source",
+                            "attention_requested",
+                            "attention_actual",
+                            "thinker_attention_actual",
+                            "text_decoder_attention_actual",
+                            "talker_enabled",
+                            "return_audio",
+                            "generation_config",
+                            "logical_weight_bits",
+                            "logical_activation_bits",
+                            "mas_enabled",
+                            "cmc_enabled",
+                            "cmc_scope",
+                            "quant_cmc",
+                            "rank_argument",
+                            "full_rank",
+                            "fullrank_adapter_sha256",
+                            "scales_sha256",
+                            "white_matrix_sha256",
+                            "normalizer_source_repository",
+                            "normalizer_source_commit",
+                            "normalizer_pipeline",
+                            "prefix_stripping",
+                        )
+                    }
                 reference_raw = record.get("reference", "")
                 hypothesis_raw = get_record_hypothesis(record)
                 reference = normalize_librispeech_text(reference_raw, args.normalization)
@@ -329,7 +550,11 @@ def score_librispeech_jsonl(args):
                     empty_hyp += 1
                 if record.get("hit_max_new_tokens"):
                     hit_max += 1
-                substitutions, insertions, deletions, wer_impl = word_error_counts(reference, hypothesis)
+                substitutions, insertions, deletions, wer_impl, jiwer_version = word_error_counts(
+                    reference,
+                    hypothesis,
+                    require_jiwer=args.normalization == "qwen_asr_en",
+                )
                 reference_words = len(reference.split())
                 totals["substitutions"] += substitutions
                 totals["insertions"] += insertions
@@ -367,6 +592,7 @@ def score_librispeech_jsonl(args):
     edit_distance = totals["substitutions"] + totals["insertions"] + totals["deletions"]
     wer_fraction = edit_distance / totals["reference_words"] if totals["reference_words"] else 0.0
     summary = {
+        **(response_metadata or {}),
         "input_file": str(input_path),
         "scored_output": str(scored_path) if scored_path else "",
         "samples": sample_count,
@@ -381,6 +607,7 @@ def score_librispeech_jsonl(args):
         "wer_fraction": wer_fraction,
         "wer_percent": wer_fraction * 100,
         "wer_implementation": wer_impl,
+        "jiwer_version": jiwer_version,
         "normalization": args.normalization,
         "examples": examples,
     }
@@ -404,6 +631,7 @@ def evaluate_librispeech_wer(llm, args, logger):
     if hasattr(generation_model, "thinker"):
         generation_model.thinker = llm.model
     generation_model.eval()
+    runtime_metadata = collect_qwen_omni_runtime_metadata(llm, generation_model, args)
 
     output_handle = None
     if args.output_file:
@@ -417,15 +645,17 @@ def evaluate_librispeech_wer(llm, args, logger):
     possible_truncation = 0
     examples = []
     wer_impl = "levenshtein_fallback"
+    jiwer_version = None
 
     print(f"ASR model class: {generation_model.__class__.__name__}")
     print(f"ASR thinker class: {llm.model.__class__.__name__}")
     print(f"ASR talker enabled: {bool(getattr(generation_model, 'has_talker', False))}")
+    print("ASR runtime metadata: " + json.dumps(runtime_metadata, ensure_ascii=False))
     print(f"ASR samples: {len(samples)}, split: {args.split}, max_new_tokens: {args.max_new_tokens}")
 
     try:
         for index, sample in enumerate(samples, start=1):
-            reference = normalize_asr_text(sample["reference"])
+            reference = normalize_librispeech_text(sample["reference"], args.normalization)
             if not reference:
                 print(f"[{index}/{len(samples)}] {sample['id']} skipped: empty reference")
                 failed += 1
@@ -434,8 +664,27 @@ def evaluate_librispeech_wer(llm, args, logger):
             hypothesis_raw = ""
             generated_token_count = 0
             error = None
+            generation_kwargs = {
+                "return_audio": False,
+                "use_audio_in_video": False,
+                "do_sample": False,
+                "repetition_penalty": 1.0,
+                "num_beams": 1,
+            }
+            if hasattr(generation_model, "thinker"):
+                generation_kwargs["thinker_max_new_tokens"] = args.max_new_tokens
+            else:
+                generation_kwargs["max_new_tokens"] = args.max_new_tokens
             try:
-                conversations = [[
+                messages = []
+                if args.asr_system_prompt:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": [{"type": "text", "text": args.asr_system_prompt}],
+                        }
+                    )
+                messages.append(
                     {
                         "role": "user",
                         "content": [
@@ -443,7 +692,8 @@ def evaluate_librispeech_wer(llm, args, logger):
                             {"type": "text", "text": args.asr_prompt},
                         ],
                     }
-                ]]
+                )
+                conversations = [messages]
                 text = processor.apply_chat_template(
                     conversations,
                     add_generation_prompt=True,
@@ -466,17 +716,6 @@ def evaluate_librispeech_wer(llm, args, logger):
                             value = value.to(llm.model.dtype)
                         inputs[key] = value
 
-                generation_kwargs = {
-                    "return_audio": False,
-                    "use_audio_in_video": False,
-                    "do_sample": False,
-                    "repetition_penalty": 1.0,
-                    "num_beams": 1,
-                }
-                if hasattr(generation_model, "thinker"):
-                    generation_kwargs["thinker_max_new_tokens"] = args.max_new_tokens
-                else:
-                    generation_kwargs["max_new_tokens"] = args.max_new_tokens
                 output_ids = generation_model.generate(**inputs, **generation_kwargs)
                 prompt_length = inputs["input_ids"].shape[1]
                 generated_ids = output_ids[0, prompt_length:]
@@ -490,14 +729,18 @@ def evaluate_librispeech_wer(llm, args, logger):
                 failed += 1
                 error = f"{type(exc).__name__}: {exc}"
 
-            hypothesis = normalize_asr_text(hypothesis_raw)
+            hypothesis = normalize_librispeech_text(hypothesis_raw, args.normalization)
             if not hypothesis:
                 empty_hyp += 1
             hit_max_new_tokens = generated_token_count >= args.max_new_tokens - 1
             if hit_max_new_tokens:
                 possible_truncation += 1
 
-            substitutions, insertions, deletions, wer_impl = word_error_counts(reference, hypothesis)
+            substitutions, insertions, deletions, wer_impl, jiwer_version = word_error_counts(
+                reference,
+                hypothesis,
+                require_jiwer=args.normalization == "qwen_asr_en",
+            )
             reference_words = len(reference.split())
             totals["substitutions"] += substitutions
             totals["insertions"] += insertions
@@ -508,6 +751,7 @@ def evaluate_librispeech_wer(llm, args, logger):
 
             record = {
                 **sample,
+                **asr_response_metadata(args, runtime_metadata, generation_kwargs),
                 "reference_normalized": reference,
                 "hypothesis": hypothesis_raw,
                 "hypothesis_normalized": hypothesis,
@@ -548,6 +792,17 @@ def evaluate_librispeech_wer(llm, args, logger):
         "wer_fraction": final_wer,
         "wer_percent": final_wer * 100,
         "wer_implementation": wer_impl,
+        "jiwer_version": jiwer_version,
+        "runtime_metadata": runtime_metadata,
+        "method": args.method_name,
+        "model_dtype": args.model_dtype_label,
+        "model_dtype_torch": runtime_metadata["thinker_first_float_dtype"],
+        "dtype_evidence": "runtime_verified" if args.method_name == "dense-bf16" else "runtime_observed",
+        "paper_baseline_label": "Dense FP16",
+        "prompt_label": args.prompt_label,
+        "system_prompt": args.asr_system_prompt,
+        "user_prompt": args.asr_prompt,
+        "normalization": args.normalization,
         "examples": examples,
     }
     print("LIBRISPEECH_WER_SUMMARY " + json.dumps(summary, ensure_ascii=False))
@@ -1109,7 +1364,16 @@ def main_entry(args=None):
     parser.add_argument("--subset_name", default="")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--asr_prompt", default=ASR_PROMPT)
-    parser.add_argument("--normalization", default="librispeech_basic", choices=["librispeech_basic"])
+    parser.add_argument("--asr_system_prompt", default="")
+    parser.add_argument("--prompt_label", default="")
+    parser.add_argument("--prompt_source", default="CLI arguments")
+    parser.add_argument("--method_name", default="dense-bf16")
+    parser.add_argument("--model_dtype_label", default="bfloat16")
+    parser.add_argument(
+        "--normalization",
+        default="librispeech_basic",
+        choices=["librispeech_basic", "qwen_asr_en"],
+    )
     parser.add_argument("--score_output", default="")
     parser.add_argument("--scored_output", default="")
     parser.add_argument("--local_files_only", action="store_true")
