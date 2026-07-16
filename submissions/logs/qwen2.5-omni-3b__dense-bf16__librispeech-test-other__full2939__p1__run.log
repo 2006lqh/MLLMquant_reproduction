@@ -1,0 +1,84 @@
+MODEL: Qwen2.5-Omni-3B
+METHOD: dense-bf16
+MODEL_DTYPE_EXPECTED: torch.bfloat16
+DTYPE_EVIDENCE: pending_runtime_verification
+PAPER_BASELINE_LABEL: Dense FP16
+QUANTIZATION: None
+DATASET: LibriSpeech
+SPLIT: test-other
+SUBSET: full2939
+EXPECTED_SAMPLES: 2939
+PROMPT_LABEL: P1
+SYSTEM_PROMPT: You are a speech recognition model.
+USER_PROMPT: Transcribe the English audio into text without any punctuation marks.
+PROMPT_SOURCE: Qwen2.5-Omni official cookbook ASR example
+PUBLISHED_LIBRISPEECH_PROTOCOL_VERIFIED: No
+INPUT_SOURCE: direct test-other directory scan
+PERSISTENT_INPUT_CREATED: No
+NORMALIZATION: qwen_asr_en
+NORMALIZER_SOURCE_REPOSITORY: QwenLM/Qwen2-Audio
+NORMALIZER_SOURCE_COMMIT: 595360e82b5839c1507492ec83cae5bda6d5c7d4
+PREFIX_STRIPPING: No
+SCORER: jiwer.process_words
+JIWER_VERSION: 4.0.0
+WER_AGGREGATION: global S/I/D/N
+FLASH_ATTN_VERSION: 2.8.3
+FLASH_ATTN_KERNEL_SMOKE_TEST: passed
+ATTENTION_REQUESTED: flash_attention_2
+TALKER_EXPECTED: False
+RETURN_AUDIO: False
+MAX_NEW_TOKENS: 256
+DO_SAMPLE: False
+NUM_BEAMS: 1
+REPETITION_PENALTY: 1.0
+BATCH_SIZE: 1
+GPU_PHYSICAL_INDEX: 0
+GPU_UUID: GPU-a88ac930-05ec-410f-65da-1bb2e918b714
+GPU_MEMORY_TOTAL_MIB: 24576
+GPU_MEMORY_USED_MIB: 268
+GPU_MEMORY_FREE_MIB: 23991
+MAX_MEMORY_GIB: 20
+CUDA_VISIBLE_DEVICES: 0
+OUTPUT_RESPONSE: /home/zhouyangchengyu/project_origin/submissions/experiments/qwen2.5-omni-3b__dense-bf16__librispeech-test-other__full2939__p1__response.jsonl
+OUTPUT_SCORED: /home/zhouyangchengyu/project_origin/submissions/experiments/qwen2.5-omni-3b__dense-bf16__librispeech-test-other__full2939__p1__scored.jsonl
+OUTPUT_SUMMARY: /home/zhouyangchengyu/project_origin/submissions/experiments/qwen2.5-omni-3b__dense-bf16__librispeech-test-other__full2939__p1__summary.json
+TMUX_SESSION: Dense
+START_TIME: 2026-07-15 05:44:56 CST
+STATUS: starting
+CUDA extension not installed.
+CUDA extension not installed.
+['main.py', '--model', '/data/liuqinheng/models/Qwen2.5-Omni-3B', '--mode', 'infer', '--epochs', '0', '--wbits', '16', '--abits', '16', '--batch_size', '1', '--eval_omni_task', '--compute_wer', '--librispeech_root', '/data/liuqinheng/benchmark/LibriSpeech', '--split', 'test-other', '--subset_name', 'full2939', '--asr_system_prompt', 'You are a speech recognition model.', '--asr_prompt', 'Transcribe the English audio into text without any punctuation marks.', '--prompt_label', 'P1', '--prompt_source', 'Qwen2.5-Omni official cookbook ASR example', '--method_name', 'dense-bf16', '--model_dtype_label', 'bfloat16', '--normalization', 'qwen_asr_en', '--max_new_tokens', '256', '--attn_implementation', 'flash_attention_2', '--local_files_only', '--max_memory_gib', '20', '--output_file', '/home/zhouyangchengyu/project_origin/submissions/experiments/qwen2.5-omni-3b__dense-bf16__librispeech-test-other__full2939__p1__response.jsonl', '--cache_dir', '/home/zhouyangchengyu/project_origin/cache', '--output_dir', '/tmp/mllmquant-dense-bf16-p1-z1mZ7T']
+->>>>> output_dir is: /tmp/mllmquant-dense-bf16-p1-z1mZ7T/Qwen2.5-Omni-3B-0epochs-w16a16--0715-054501.798887-merged_scales/mas_parameters.pth 
+[2026-07-15 05:45:01 root](main.py 1426): INFO Namespace(model='/data/liuqinheng/models/Qwen2.5-Omni-3B', mode='infer', cache_dir='/home/zhouyangchengyu/project_origin/cache', output_dir='/tmp/mllmquant-dense-bf16-p1-z1mZ7T/Qwen2.5-Omni-3B-0epochs-w16a16--0715-054501.798887-merged_scales', output_dir_postfix='', save_dir=None, resume=None, calib_dataset='omnibench', nsamples=128, batch_size=1, seed=2, tasks='', tasks_multimodal='', eval_ppl=False, auto_scale=False, auto_alpha=False, auto_epochs=False, loss_multi_modal=False, loss_multi_modal_mae=False, loss_multi_modal_mae_alpha=False, ppl_result='ppl_result.csv', eval_sqnr=False, sqnr_result='sqnr_result.csv', num_fewshot=0, wbits=16, abits=16, group_size=None, alpha=0.5, let_lr=0.05, lwc_lr=0.01, wd=0, epochs=0, let=False, lwc=False, aug_loss=False, symmetric=False, disable_zero_point=False, a_dynamic_method='per_token', w_dynamic_method='per_channel', limit=-1, limit_multimodal=1.0, multigpu=False, deactive_amp=False, attn_implementation='flash_attention_2', net='Qwen2.5-Omni-3B', act_scales=None, act_shifts=None, input_file='', output_file='/home/zhouyangchengyu/project_origin/submissions/experiments/qwen2.5-omni-3b__dense-bf16__librispeech-test-other__full2939__p1__response.jsonl', grad_info_path='', eval_omni_task=True, compute_wer=True, make_librispeech_jsonl=False, score_librispeech_jsonl=False, librispeech_root='/data/liuqinheng/benchmark/LibriSpeech', split='test-other', max_samples=None, sample_order='sorted', sample_seed=42, subset_name='full2939', max_new_tokens=256, asr_prompt='Transcribe the English audio into text without any punctuation marks.', asr_system_prompt='You are a speech recognition model.', prompt_label='P1', prompt_source='Qwen2.5-Omni official cookbook ASR example', method_name='dense-bf16', model_dtype_label='bfloat16', normalization='qwen_asr_en', score_output='', scored_output='', local_files_only=True, max_memory_gib=20, dataset_type='text-audio-vision')
+[2026-07-15 05:45:01 root](main.py 1427): INFO inference_mode:  merged_scales
+Unrecognized keys in `rope_scaling` for 'rope_type'='default': {'mrope_section'}
+🚨 `multi_modal_mask` is part of Qwen2_5OmniThinkerTextModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /home/zhouyangchengyu/project_origin/EfficientAI/masquant/models/modeling_qwen2_5_omni.py.
+Unrecognized keys in `rope_scaling` for 'rope_type'='default': {'mrope_section'}
+You are attempting to use Flash Attention 2.0 with a model not initialized on GPU. Make sure to move the model to GPU after initializing it on CPU with `model.to('cuda')`.
+use modeling_qwen2_5_omni locally. 
+You are attempting to use Flash Attention 2.0 without specifying a torch dtype. This might lead to unexpected behaviour
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s]Loading checkpoint shards:  33%|███▎      | 1/3 [00:00<00:00,  5.38it/s]Loading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 12.91it/s]
+we will use omni-thinker model only.
+vocab size:  151643
+[2026-07-15 05:45:15 qwen_omni_utils.v2_5.vision_process](vision_process.py 42): INFO set VIDEO_TOTAL_PIXELS: 90316800
+You have video processor config saved in `preprocessor.json` file which is deprecated. Video processor configs should be saved in their own `video_preprocessor.json` file. You can rename the file or load and save the processor back which renames it automatically. Loading from `preprocessor.json` will be removed in v5.0.
+Traceback (most recent call last):
+  File "/home/zhouyangchengyu/project_origin/EfficientAI/masquant/main.py", line 1563, in <module>
+    main_entry()
+  File "/home/zhouyangchengyu/project_origin/EfficientAI/masquant/main.py", line 1558, in main_entry
+    evaluate(llm, args,logger)
+  File "/home/zhouyangchengyu/miniconda3/envs/masquant/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/zhouyangchengyu/project_origin/EfficientAI/masquant/main.py", line 996, in evaluate
+    results["librispeech_wer"] = evaluate_librispeech_wer(llm, args, logger)
+  File "/home/zhouyangchengyu/miniconda3/envs/masquant/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/zhouyangchengyu/project_origin/EfficientAI/masquant/main.py", line 612, in evaluate_librispeech_wer
+    runtime_metadata = collect_qwen_omni_runtime_metadata(llm, generation_model, args)
+  File "/home/zhouyangchengyu/project_origin/EfficientAI/masquant/main.py", line 410, in collect_qwen_omni_runtime_metadata
+    raise RuntimeError(
+RuntimeError: dense-bf16 ASR attention mismatch for the text decoder: requested=flash_attention_2, actual=eager.
+STATUS: failed
+FAILED_STAGE: inference
+END_TIME: 2026-07-15 05:45:17 CST
+EXIT_CODE: 1
